@@ -1,245 +1,230 @@
 """
-=====================================================
-  CRYPTO PUMP SCANNER - MAIN ORCHESTRATOR
-  Run: python main.py
-  
-  Flow every 5 minutes:
-  1. Fetch top 1000 coins by market cap (CoinGecko)
-  2. Filter to tradeable pairs on Binance/Gate/OKX
-  3. Fetch OHLCV on multiple timeframes
-  4. Score every coin across 20+ metrics
-  5. Pick top 10 by pump_score
-  6. Send formatted signals to Telegram
-=====================================================
+CRYPTO PUMP SCANNER - RENDER FREE WEB SERVICE
+HTTP server starts FIRST on correct port, scanner in background thread
 """
 
+import os
 import time
 import logging
 import threading
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import List, Dict, Optional
-import pandas as pd
 
 from config import (
     SCAN_INTERVAL_MINUTES, TOP_N_COINS, MARKET_CAP_TOP,
     TIMEFRAMES, PRIMARY_TIMEFRAME, MIN_SIGNAL_SCORE, QUOTE_CURRENCY
 )
-from fetcher  import init_exchanges, fetch_top_coins, get_tradeable_symbols, batch_fetch_ohlcv
+from fetcher  import init_exchanges, fetch_top_coins, get_tradeable_symbols, fetch_ohlcv
 from analysis import compute_full_score
 from notifier import send_scan_results
 
-# ─── Logging Setup ───────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("pump_scanner.log", encoding="utf-8"),
-    ]
+    handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger("main")
 
+STATUS = {
+    "last_scan" : "Not yet run",
+    "scanned"   : 0,
+    "top_coins" : [],
+    "scan_count": 0,
+    "status"    : "starting",
+}
 
-# ─────────────────────────────────────────────
-#  MULTI-TIMEFRAME SCORING
-# ─────────────────────────────────────────────
+# ── HTTP Server ───────────────────────────────────────────────
 
-def score_with_multi_tf(
-    exchanges: dict,
-    coins: List[Dict],
-    timeframes: List[str],
-    primary: str
-) -> List[Dict]:
-    """
-    Score each coin across all timeframes.
-    Primary TF gets 60% weight, others split the rest.
-    """
-    results = []
-    tf_weights = {}
-    n_tf = len(timeframes)
-    for tf in timeframes:
-        tf_weights[tf] = 0.6 if tf == primary else 0.4 / (n_tf - 1)
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        top  = STATUS["top_coins"]
+        rows = "".join(
+            f"<tr><td>{i+1}</td><td><b>${c['symbol']}</b></td>"
+            f"<td>{c['pump_score']}/10</td>"
+            f"<td>{c.get('rsi','-')}</td>"
+            f"<td>{c.get('trend_label','-')}</td></tr>"
+            for i, c in enumerate(top)
+        )
+        html = f"""<!DOCTYPE html><html>
+<head><title>🚀 Crypto Pump Scanner</title>
+<meta http-equiv="refresh" content="60">
+<style>
+body{{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px}}
+h1{{color:#58a6ff}}
+table{{border-collapse:collapse;width:100%}}
+th,td{{border:1px solid #30363d;padding:8px 12px;text-align:left}}
+th{{background:#161b22;color:#58a6ff}}
+.badge{{background:#238636;padding:2px 8px;border-radius:4px;color:#fff;font-size:12px}}
+</style></head>
+<body>
+<h1>🚀 Crypto Pump Scanner</h1>
+<p>Status: <span class="badge">{STATUS['status']}</span>
+&nbsp;|&nbsp; Last scan: <b>{STATUS['last_scan']}</b>
+&nbsp;|&nbsp; Total scans: <b>{STATUS['scan_count']}</b>
+&nbsp;|&nbsp; Coins scanned: <b>{STATUS['scanned']}</b></p>
+<h2>🏆 Top {len(top)} Pump Candidates</h2>
+<table>
+<tr><th>#</th><th>Symbol</th><th>Score</th><th>RSI</th><th>Trend</th></tr>
+{rows if rows else '<tr><td colspan=5>Waiting for first scan...</td></tr>'}
+</table>
+<p style="color:#8b949e;font-size:12px">⚠️ Not financial advice. Auto-refreshes every 60s.</p>
+</body></html>"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(html.encode())
 
-    for coin_info in coins:
-        sym    = coin_info["symbol"]
-        ex     = coin_info["exchange"]
-        csym   = coin_info["ccxt_symbol"]
-        logger.info(f"  Analysing {sym} on {ex} …")
-
-        tf_scores = {}
-        primary_result = None
-
-        for tf in timeframes:
-            from fetcher import fetch_ohlcv
-            df = fetch_ohlcv(exchanges, ex, csym, tf, limit=300)
-            if df is None or len(df) < 220:
-                logger.debug(f"    {sym} {tf}: insufficient data")
-                continue
-            result = compute_full_score(df)
-            if "error" in result:
-                continue
-            tf_scores[tf] = result["pump_score"]
-            if tf == primary:
-                primary_result = result
-
-        if not primary_result:
-            continue
-
-        # Weighted composite across timeframes
-        if tf_scores:
-            composite = sum(
-                tf_scores.get(tf, primary_result["pump_score"]) * tf_weights.get(tf, 0)
-                for tf in timeframes
-            )
-        else:
-            composite = primary_result["pump_score"]
-
-        composite = round(min(10, composite), 2)
-        entry = {**primary_result}
-        entry["pump_score"]   = composite
-        entry["tf_scores"]    = tf_scores
-        entry["symbol"]       = sym
-        entry["exchange"]     = ex
-        entry["ccxt_symbol"]  = csym
-        entry["volume_usdt"]  = coin_info["volume_usdt"]
-        results.append(entry)
-
-    return results
+    def log_message(self, *args):
+        pass
 
 
-# ─────────────────────────────────────────────
-#  MAIN SCAN LOOP
-# ─────────────────────────────────────────────
+# ── Scanner Logic ─────────────────────────────────────────────
 
-_coin_cache: List[str]  = []
-_cache_ts: float        = 0
-CACHE_TTL_SECONDS       = 3600    # Refresh top-1000 list every hour
+_coin_cache: List[str] = []
+_cache_ts: float       = 0
+CACHE_TTL              = 3600
 
 
-def get_top_coins_cached() -> List[str]:
+def get_top_coins_cached():
     global _coin_cache, _cache_ts
-    now = time.time()
-    if not _coin_cache or (now - _cache_ts) > CACHE_TTL_SECONDS:
+    if not _coin_cache or (time.time() - _cache_ts) > CACHE_TTL:
         logger.info(f"Fetching top {MARKET_CAP_TOP} coins from CoinGecko …")
         _coin_cache = fetch_top_coins(MARKET_CAP_TOP)
-        _cache_ts   = now
+        _cache_ts   = time.time()
         logger.info(f"Cached {len(_coin_cache)} coins")
     return _coin_cache
 
 
-def run_scan(exchanges: dict) -> Optional[List[Dict]]:
-    scan_start = datetime.utcnow()
-    logger.info(f"\n{'='*55}")
-    logger.info(f"  🔍 SCAN STARTED — {scan_start.strftime('%H:%M:%S UTC')}")
-    logger.info(f"{'='*55}")
+def score_with_multi_tf(exchanges, coins, timeframes, primary):
+    n_tf       = len(timeframes)
+    tf_weights = {tf: (0.6 if tf == primary else 0.4 / (n_tf - 1)) for tf in timeframes}
+    results    = []
 
-    # 1. Top coins list
+    for coin_info in coins:
+        sym, ex, csym = coin_info["symbol"], coin_info["exchange"], coin_info["ccxt_symbol"]
+        logger.info(f"  Analysing {sym} …")
+        tf_scores, primary_result = {}, None
+
+        for tf in timeframes:
+            df = fetch_ohlcv(exchanges, ex, csym, tf, limit=300)
+            if df is None or len(df) < 220:
+                continue
+            res = compute_full_score(df)
+            if "error" in res:
+                continue
+            tf_scores[tf] = res["pump_score"]
+            if tf == primary:
+                primary_result = res
+
+        if not primary_result:
+            continue
+
+        composite = round(min(10, sum(
+            tf_scores.get(tf, primary_result["pump_score"]) * tf_weights.get(tf, 0)
+            for tf in timeframes
+        )), 2)
+
+        results.append({**primary_result,
+                        "pump_score" : composite,
+                        "symbol"     : sym,
+                        "exchange"   : ex,
+                        "ccxt_symbol": csym,
+                        "volume_usdt": coin_info["volume_usdt"]})
+    return results
+
+
+def run_scan(exchanges):
+    STATUS["status"] = "scanning"
+    start = datetime.now()
+    logger.info(f"\n{'='*50}\n  🔍 SCAN — {start.strftime('%H:%M:%S UTC')}\n{'='*50}")
+
     top_coins = get_top_coins_cached()
     if not top_coins:
-        logger.error("Failed to fetch top coins list")
-        return None
+        STATUS["status"] = "error: no coins"
+        return
 
-    # 2. Filter to tradeable symbols
-    logger.info("Cross-referencing with exchange markets …")
     tradeable = get_tradeable_symbols(exchanges, top_coins, QUOTE_CURRENCY)
-    logger.info(f"Found {len(tradeable)} tradeable pairs with sufficient liquidity")
+    logger.info(f"{len(tradeable)} tradeable pairs found")
+    STATUS["scanned"] = len(tradeable)
 
     if not tradeable:
-        logger.error("No tradeable pairs found — check exchange connections")
-        return None
+        STATUS["status"] = "error: no tradeable pairs"
+        return
 
-    # 3. Score all coins (multi-timeframe)
-    logger.info(f"Scoring {len(tradeable)} coins across {TIMEFRAMES} …")
     results = score_with_multi_tf(exchanges, tradeable, TIMEFRAMES, PRIMARY_TIMEFRAME)
-    logger.info(f"Scored {len(results)} coins successfully")
-
-    # 4. Filter by minimum score
     results = [r for r in results if r["pump_score"] >= MIN_SIGNAL_SCORE]
-
-    # 5. Sort by pump_score descending, take top N
     results.sort(key=lambda x: x["pump_score"], reverse=True)
     top = results[:TOP_N_COINS]
 
-    if not top:
-        logger.warning("No coins passed the minimum signal threshold this scan")
-        return []
-
-    # 6. Log summary
-    logger.info(f"\n{'─'*45}")
-    logger.info(f"  🏆 TOP {len(top)} PUMP CANDIDATES:")
-    logger.info(f"{'─'*45}")
     for i, r in enumerate(top, 1):
-        logger.info(
-            f"  {i:>2}. {r['symbol']:<10} Score={r['pump_score']}/10  "
-            f"RSI={r['rsi']:.1f}  Vol={r['vol_ratio']:.1f}x  "
-            f"Trend={r['trend_label']}"
-        )
-    logger.info(f"{'─'*45}\n")
+        logger.info(f"  {i:>2}. {r['symbol']:<10} Score={r['pump_score']}/10  RSI={r['rsi']:.1f}")
 
-    # 7. Send to Telegram
-    logger.info("Sending signals to Telegram …")
+    STATUS["last_scan"]  = start.strftime("%Y-%m-%d %H:%M UTC")
+    STATUS["top_coins"]  = top
+    STATUS["scan_count"] += 1
+    STATUS["status"]     = "idle"
+
     send_scan_results(top, len(tradeable))
-    logger.info("✅ Signals sent!")
-
-    elapsed = (datetime.utcnow() - scan_start).total_seconds()
-    logger.info(f"Scan completed in {elapsed:.1f}s")
-    return top
+    logger.info(f"✅ Scan done in {(datetime.now()-start).total_seconds():.1f}s")
 
 
-# ─────────────────────────────────────────────
-#  SCHEDULER
-# ─────────────────────────────────────────────
-
-def scheduler_loop(exchanges: dict):
+def scanner_loop(exchanges):
     interval = SCAN_INTERVAL_MINUTES * 60
-    logger.info(f"⏱  Scheduler started — scanning every {SCAN_INTERVAL_MINUTES} minutes")
+    logger.info(f"⏱  Scanner thread — every {SCAN_INTERVAL_MINUTES} min")
 
-    # Run immediately on start
+    # Wait 10s for HTTP server to fully start first
+    time.sleep(10)
+
     try:
         run_scan(exchanges)
     except Exception as e:
-        logger.error(f"First scan failed: {e}", exc_info=True)
+        logger.error(f"Scan error: {e}", exc_info=True)
+        STATUS["status"] = f"error: {e}"
 
-    # Then loop
     while True:
-        next_scan = time.time() + interval
-        logger.info(f"💤 Next scan in {SCAN_INTERVAL_MINUTES} minutes …")
-        while time.time() < next_scan:
-            time.sleep(10)
+        next_at = time.time() + interval
+        logger.info(f"💤 Next scan in {SCAN_INTERVAL_MINUTES} min")
+        while time.time() < next_at:
+            time.sleep(15)
         try:
             run_scan(exchanges)
         except Exception as e:
             logger.error(f"Scan error: {e}", exc_info=True)
+            STATUS["status"] = f"error: {e}"
 
 
-# ─────────────────────────────────────────────
-#  ENTRY POINT
-# ─────────────────────────────────────────────
+# ── Entry Point ───────────────────────────────────────────────
 
 def main():
+    PORT = int(os.environ.get("PORT", 10000))
+
     print("""
 ╔══════════════════════════════════════════════╗
-║     🚀 CRYPTO PUMP SCANNER - STARTING UP     ║
-║                                              ║
-║  Exchanges : Binance · Gate.io · OKX         ║
-║  Metrics   : RSI · MACD · BOS · CHoCH · OB  ║
-║              FVG · Volume · Momentum ·       ║
-║              Velocity · ADX · MFI · CCI ·   ║
-║              Stoch · Williams%R · VWAP ·     ║
-║              OBV · P/D · Liquidity · MM      ║
-║  Output    : Telegram + Console              ║
+║     🚀 CRYPTO PUMP SCANNER — RENDER FREE     ║
 ╚══════════════════════════════════════════════╝
 """)
 
-    logger.info("Initialising exchanges …")
-    try:
-        exchanges = init_exchanges()
-    except RuntimeError as e:
-        logger.critical(f"Cannot start: {e}")
-        return
+    # Step 1: Start HTTP server FIRST (Render needs port binding immediately)
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    logger.info(f"🌐 HTTP server started on port {PORT}")
 
-    logger.info(f"Connected exchanges: {list(exchanges.keys())}")
-    scheduler_loop(exchanges)
+    # Step 2: Init exchanges in background thread
+    def start_scanner():
+        try:
+            exchanges = init_exchanges()
+            logger.info(f"Connected: {list(exchanges.keys())}")
+            scanner_loop(exchanges)
+        except Exception as e:
+            logger.critical(f"Scanner failed: {e}", exc_info=True)
+            STATUS["status"] = f"error: {e}"
+
+    t = threading.Thread(target=start_scanner, daemon=True)
+    t.start()
+
+    # Step 3: HTTP server runs forever on main thread
+    logger.info("✅ Ready — scanner starting in background …")
+    server.serve_forever()
 
 
 if __name__ == "__main__":
