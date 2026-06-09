@@ -1,15 +1,11 @@
 """
-=====================================================
-  EXCHANGE DATA FETCHER
-  Supports: Binance, Gate.io, OKX (via ccxt)
-  - Top 1000 coins by market cap (CoinGecko)
-  - OHLCV fetching with fallback across exchanges
-=====================================================
+EXCHANGE DATA FETCHER
+Supports: Gate.io, OKX, Binance (via ccxt)
+Coins fetched directly from exchange — no CoinGecko dependency
 """
 
 import ccxt
 import pandas as pd
-import numpy as np
 import requests
 import time
 import logging
@@ -75,110 +71,84 @@ def init_exchanges() -> Dict[str, ccxt.Exchange]:
     return exs
 
 
-def fetch_top_coins(limit: int = 1000) -> List[str]:
-    """Fetch top coins by market cap from CoinGecko with retry + fallback."""
-    symbols  = []
-    per_page = 250
-    pages    = (limit // per_page) + 1
-    base_url = "https://api.coingecko.com/api/v3/coins/markets"
-    headers  = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
-
-    for page in range(1, pages + 1):
-        for attempt in range(3):
-            try:
-                resp = requests.get(base_url, headers=headers, params={
-                    "vs_currency": "usd",
-                    "order"      : "market_cap_desc",
-                    "per_page"   : per_page,
-                    "page"       : page,
-                    "sparkline"  : False,
-                }, timeout=30)
-
-                if resp.status_code == 429:
-                    logger.warning("CoinGecko rate limit — waiting 60s")
-                    time.sleep(60)
-                    continue
-
-                if resp.status_code != 200:
-                    logger.warning(f"CoinGecko HTTP {resp.status_code}")
-                    time.sleep(10)
-                    continue
-
-                data = resp.json()
-                if not isinstance(data, list):
-                    break
-
-                for coin in data:
-                    sym = coin.get("symbol", "").upper()
-                    if sym:
-                        symbols.append(sym)
-
-                logger.info(f"CoinGecko page {page}: {len(data)} coins (total {len(symbols)})")
-                time.sleep(2.5)
-                break
-
-            except Exception as e:
-                logger.warning(f"CoinGecko page {page} attempt {attempt+1}: {e}")
-                time.sleep(15)
-
-        if len(symbols) >= limit:
-            break
-
-    # Fallback if CoinGecko fails
-    if len(symbols) < 10:
-        logger.warning("CoinGecko failed — using hardcoded top 100 fallback")
-        symbols = [
-            "BTC","ETH","BNB","SOL","XRP","ADA","AVAX","DOGE","TRX","TON",
-            "LINK","DOT","MATIC","SHIB","LTC","BCH","UNI","ATOM","XLM","ETC",
-            "APT","FIL","HBAR","ICP","VET","ARB","OP","NEAR","ALGO","GRT",
-            "AAVE","STX","FTM","SAND","MANA","AXS","CHZ","EGLD","FLOW","THETA",
-            "XTZ","EOS","CAKE","NEO","ZEC","DASH","BAT","ENJ","ZIL","IOTA",
-            "SUI","SEI","TIA","INJ","WLD","PEPE","FLOKI","BONK","WIF","JUP",
-            "NOT","ZK","1INCH","COMP","MKR","SNX","YFI","SUSHI","CRV","DYDX",
-            "RENDER","FET","OCEAN","AGIX","RNDR","IMX","LDO","RPL","SSV","PENDLE",
-            "GMX","GNS","RDNT","VELA","HMX","MYRO","BOME","SLERF","MEW","POPCAT",
-            "NEIRO","TURBO","MOG","BRETT","TOSHI","GIGA","PNUT","ACT","GOAT","MOODENG"
-        ]
-
-    return symbols[:limit]
-
-
-def get_tradeable_symbols(
-    exchanges: Dict[str, ccxt.Exchange],
-    coin_list: List[str],
-    quote: str = QUOTE_CURRENCY
-) -> List[Dict]:
-    tradeable = []
-    seen      = set()
+def fetch_top_coins_from_exchange(exchanges: Dict, limit: int = 1000) -> List[str]:
+    """
+    Get top coins by volume directly from connected exchanges.
+    No CoinGecko needed — 100% reliable.
+    """
+    quote   = QUOTE_CURRENCY
+    tickers = {}
 
     for ex_name, ex in exchanges.items():
-        markets = ex.markets or {}
-        for coin in coin_list:
-            ccxt_sym = f"{coin}/{quote}"
-            if ccxt_sym not in markets:
-                continue
-            if coin in seen:
-                continue
-            market = markets[ccxt_sym]
-            if not market.get("active", True):
-                continue
-            try:
-                ticker   = ex.fetch_ticker(ccxt_sym)
-                vol_usd  = ticker.get("quoteVolume", 0) or 0
-                if vol_usd < MIN_LIQUIDITY_USDT:
+        try:
+            logger.info(f"Fetching tickers from {ex_name} …")
+            all_tickers = ex.fetch_tickers()
+            for sym, t in all_tickers.items():
+                if not sym.endswith(f"/{quote}"):
                     continue
-                tradeable.append({
-                    "symbol"     : coin,
-                    "exchange"   : ex_name,
-                    "ccxt_symbol": ccxt_sym,
-                    "volume_usdt": vol_usd,
-                })
-                seen.add(coin)
-            except Exception:
-                continue
+                base      = sym.replace(f"/{quote}", "")
+                vol       = t.get("quoteVolume") or 0
+                # Keep highest volume across exchanges
+                if base not in tickers or vol > tickers[base]["vol"]:
+                    tickers[base] = {"vol": vol, "exchange": ex_name, "ccxt_sym": sym}
+        except Exception as e:
+            logger.warning(f"Ticker fetch from {ex_name} failed: {e}")
 
-    tradeable.sort(key=lambda x: x["volume_usdt"], reverse=True)
-    return tradeable
+    # Sort by volume, take top N
+    sorted_coins = sorted(tickers.items(), key=lambda x: x[1]["vol"], reverse=True)
+    top = sorted_coins[:limit]
+    logger.info(f"Got {len(top)} coins from exchanges")
+    return [c[0] for c in top]
+
+
+def fetch_top_coins(limit: int = 1000) -> List[str]:
+    """Alias — kept for compatibility."""
+    return []   # Not used anymore — see get_tradeable_symbols_direct
+
+
+def get_tradeable_symbols_direct(
+    exchanges: Dict[str, ccxt.Exchange],
+    limit: int = 1000,
+    quote: str = QUOTE_CURRENCY
+) -> List[Dict]:
+    """
+    Get top tradeable symbols by 24h volume directly from exchanges.
+    Fast, reliable, no external API needed.
+    """
+    quote   = QUOTE_CURRENCY
+    seen    = {}
+
+    for ex_name, ex in exchanges.items():
+        try:
+            logger.info(f"Fetching tickers from {ex_name} …")
+            all_tickers = ex.fetch_tickers()
+            for sym, t in all_tickers.items():
+                if not sym.endswith(f"/{quote}"):
+                    continue
+                base = sym.replace(f"/{quote}", "")
+                vol  = float(t.get("quoteVolume") or 0)
+                if vol < MIN_LIQUIDITY_USDT:
+                    continue
+                if base not in seen or vol > seen[base]["volume_usdt"]:
+                    seen[base] = {
+                        "symbol"     : base,
+                        "exchange"   : ex_name,
+                        "ccxt_symbol": sym,
+                        "volume_usdt": vol,
+                    }
+        except Exception as e:
+            logger.warning(f"Tickers from {ex_name} failed: {e}")
+
+    # Sort by volume
+    result = sorted(seen.values(), key=lambda x: x["volume_usdt"], reverse=True)
+    logger.info(f"Total tradeable pairs: {len(result)}")
+    return result[:limit]
+
+
+# Keep old function name for compatibility
+def get_tradeable_symbols(exchanges, coin_list, quote=QUOTE_CURRENCY) -> List[Dict]:
+    """Redirect to direct method — ignores coin_list."""
+    return get_tradeable_symbols_direct(exchanges, limit=1000, quote=quote)
 
 
 def fetch_ohlcv(
@@ -194,14 +164,15 @@ def fetch_ohlcv(
         ex = exchanges.get(name)
         if not ex:
             continue
-        if ccxt_symbol not in (ex.markets or {}):
+        sym_to_use = ccxt_symbol
+        if sym_to_use not in (ex.markets or {}):
             base = ccxt_symbol.split("/")[0]
             alt  = f"{base}/{QUOTE_CURRENCY}"
             if alt not in (ex.markets or {}):
                 continue
-            ccxt_symbol = alt
+            sym_to_use = alt
         try:
-            raw = ex.fetch_ohlcv(ccxt_symbol, timeframe=timeframe, limit=limit)
+            raw = ex.fetch_ohlcv(sym_to_use, timeframe=timeframe, limit=limit)
             if not raw or len(raw) < 50:
                 continue
             df = pd.DataFrame(raw, columns=["timestamp","open","high","low","close","volume"])
@@ -212,25 +183,7 @@ def fetch_ohlcv(
             df.dropna(inplace=True)
             return df
         except Exception as e:
-            logger.debug(f"{name} error for {ccxt_symbol}: {e}")
+            logger.debug(f"{name} error for {sym_to_use}: {e}")
         time.sleep(0.2)
 
     return None
-
-
-def batch_fetch_ohlcv(
-    exchanges: Dict[str, ccxt.Exchange],
-    coins: List[Dict],
-    timeframe: str = "1h",
-    limit: int = 300,
-) -> Dict[str, pd.DataFrame]:
-    result = {}
-    for coin_info in coins:
-        sym  = coin_info["symbol"]
-        ex   = coin_info["exchange"]
-        csym = coin_info["ccxt_symbol"]
-        df   = fetch_ohlcv(exchanges, ex, csym, timeframe, limit)
-        if df is not None and len(df) >= 220:
-            result[sym] = df
-        time.sleep(0.1)
-    return result
