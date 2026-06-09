@@ -74,6 +74,11 @@ th{{background:#161b22;color:#58a6ff}}
         self.end_headers()
         self.wfile.write(html.encode())
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+
     def log_message(self, *args):
         pass
 
