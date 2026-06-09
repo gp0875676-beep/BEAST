@@ -199,6 +199,19 @@ def main():
         try:
             exchanges = init_exchanges()
             logger.info(f"Exchanges: {list(exchanges.keys())}")
+            # Send startup message to Telegram
+            from notifier import send_telegram
+            send_telegram("""
+🚀 <b>CRYPTO PUMP SCANNER STARTED!</b>
+
+✅ Bot has started successfully
+✅ Gate.io connected
+✅ OKX connected
+⏱ Scanning every 5 minutes
+📊 Top 10 pump signals coming soon...
+
+<i>Beast Pump Scanner is LIVE 🔥</i>
+""".strip())
             scanner_loop(exchanges)
         except Exception as e:
             logger.critical(f"Fatal: {e}", exc_info=True)
