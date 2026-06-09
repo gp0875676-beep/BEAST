@@ -1,6 +1,6 @@
 """
 CRYPTO PUMP SCANNER - RENDER FREE WEB SERVICE
-HTTP server starts FIRST on correct port, scanner in background thread
+No CoinGecko — coins fetched directly from Gate.io + OKX
 """
 
 import os
@@ -9,13 +9,13 @@ import logging
 import threading
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 from config import (
-    SCAN_INTERVAL_MINUTES, TOP_N_COINS, MARKET_CAP_TOP,
+    SCAN_INTERVAL_MINUTES, TOP_N_COINS,
     TIMEFRAMES, PRIMARY_TIMEFRAME, MIN_SIGNAL_SCORE, QUOTE_CURRENCY
 )
-from fetcher  import init_exchanges, fetch_top_coins, get_tradeable_symbols, fetch_ohlcv
+from fetcher  import init_exchanges, get_tradeable_symbols_direct, fetch_ohlcv
 from analysis import compute_full_score
 from notifier import send_scan_results
 
@@ -34,7 +34,8 @@ STATUS = {
     "status"    : "starting",
 }
 
-# ── HTTP Server ───────────────────────────────────────────────
+
+# ── HTTP Health Server ────────────────────────────────────────
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -47,28 +48,26 @@ class HealthHandler(BaseHTTPRequestHandler):
             for i, c in enumerate(top)
         )
         html = f"""<!DOCTYPE html><html>
-<head><title>🚀 Crypto Pump Scanner</title>
+<head><title>🚀 Pump Scanner</title>
 <meta http-equiv="refresh" content="60">
 <style>
 body{{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px}}
-h1{{color:#58a6ff}}
-table{{border-collapse:collapse;width:100%}}
+h1{{color:#58a6ff}}table{{border-collapse:collapse;width:100%}}
 th,td{{border:1px solid #30363d;padding:8px 12px;text-align:left}}
 th{{background:#161b22;color:#58a6ff}}
-.badge{{background:#238636;padding:2px 8px;border-radius:4px;color:#fff;font-size:12px}}
+.badge{{background:#238636;padding:2px 8px;border-radius:4px;color:#fff}}
 </style></head>
 <body>
 <h1>🚀 Crypto Pump Scanner</h1>
 <p>Status: <span class="badge">{STATUS['status']}</span>
 &nbsp;|&nbsp; Last scan: <b>{STATUS['last_scan']}</b>
-&nbsp;|&nbsp; Total scans: <b>{STATUS['scan_count']}</b>
+&nbsp;|&nbsp; Scans done: <b>{STATUS['scan_count']}</b>
 &nbsp;|&nbsp; Coins scanned: <b>{STATUS['scanned']}</b></p>
-<h2>🏆 Top {len(top)} Pump Candidates</h2>
-<table>
-<tr><th>#</th><th>Symbol</th><th>Score</th><th>RSI</th><th>Trend</th></tr>
+<h2>🏆 Top Pump Candidates</h2>
+<table><tr><th>#</th><th>Symbol</th><th>Score</th><th>RSI</th><th>Trend</th></tr>
 {rows if rows else '<tr><td colspan=5>Waiting for first scan...</td></tr>'}
 </table>
-<p style="color:#8b949e;font-size:12px">⚠️ Not financial advice. Auto-refreshes every 60s.</p>
+<p style="color:#8b949e;font-size:12px">⚠️ Not financial advice.</p>
 </body></html>"""
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
@@ -79,34 +78,19 @@ th{{background:#161b22;color:#58a6ff}}
         pass
 
 
-# ── Scanner Logic ─────────────────────────────────────────────
+# ── Scoring ───────────────────────────────────────────────────
 
-_coin_cache: List[str] = []
-_cache_ts: float       = 0
-CACHE_TTL              = 3600
-
-
-def get_top_coins_cached():
-    global _coin_cache, _cache_ts
-    if not _coin_cache or (time.time() - _cache_ts) > CACHE_TTL:
-        logger.info(f"Fetching top {MARKET_CAP_TOP} coins from CoinGecko …")
-        _coin_cache = fetch_top_coins(MARKET_CAP_TOP)
-        _cache_ts   = time.time()
-        logger.info(f"Cached {len(_coin_cache)} coins")
-    return _coin_cache
-
-
-def score_with_multi_tf(exchanges, coins, timeframes, primary):
-    n_tf       = len(timeframes)
-    tf_weights = {tf: (0.6 if tf == primary else 0.4 / (n_tf - 1)) for tf in timeframes}
+def score_coins(exchanges, coins):
+    n_tf       = len(TIMEFRAMES)
+    tf_weights = {tf: (0.6 if tf == PRIMARY_TIMEFRAME else 0.4 / (n_tf - 1)) for tf in TIMEFRAMES}
     results    = []
 
     for coin_info in coins:
         sym, ex, csym = coin_info["symbol"], coin_info["exchange"], coin_info["ccxt_symbol"]
-        logger.info(f"  Analysing {sym} …")
+        logger.info(f"  → {sym}")
         tf_scores, primary_result = {}, None
 
-        for tf in timeframes:
+        for tf in TIMEFRAMES:
             df = fetch_ohlcv(exchanges, ex, csym, tf, limit=300)
             if df is None or len(df) < 220:
                 continue
@@ -114,7 +98,7 @@ def score_with_multi_tf(exchanges, coins, timeframes, primary):
             if "error" in res:
                 continue
             tf_scores[tf] = res["pump_score"]
-            if tf == primary:
+            if tf == PRIMARY_TIMEFRAME:
                 primary_result = res
 
         if not primary_result:
@@ -122,7 +106,7 @@ def score_with_multi_tf(exchanges, coins, timeframes, primary):
 
         composite = round(min(10, sum(
             tf_scores.get(tf, primary_result["pump_score"]) * tf_weights.get(tf, 0)
-            for tf in timeframes
+            for tf in TIMEFRAMES
         )), 2)
 
         results.append({**primary_result,
@@ -134,47 +118,48 @@ def score_with_multi_tf(exchanges, coins, timeframes, primary):
     return results
 
 
+# ── Main Scan ─────────────────────────────────────────────────
+
 def run_scan(exchanges):
     STATUS["status"] = "scanning"
     start = datetime.now()
     logger.info(f"\n{'='*50}\n  🔍 SCAN — {start.strftime('%H:%M:%S UTC')}\n{'='*50}")
 
-    top_coins = get_top_coins_cached()
-    if not top_coins:
-        STATUS["status"] = "error: no coins"
-        return
-
-    tradeable = get_tradeable_symbols(exchanges, top_coins, QUOTE_CURRENCY)
+    # Get coins directly from exchange — no CoinGecko
+    tradeable = get_tradeable_symbols_direct(exchanges, limit=1000)
     logger.info(f"{len(tradeable)} tradeable pairs found")
     STATUS["scanned"] = len(tradeable)
 
     if not tradeable:
-        STATUS["status"] = "error: no tradeable pairs"
+        STATUS["status"] = "error: no pairs"
         return
 
-    results = score_with_multi_tf(exchanges, tradeable, TIMEFRAMES, PRIMARY_TIMEFRAME)
+    results = score_coins(exchanges, tradeable)
     results = [r for r in results if r["pump_score"] >= MIN_SIGNAL_SCORE]
     results.sort(key=lambda x: x["pump_score"], reverse=True)
     top = results[:TOP_N_COINS]
 
+    logger.info(f"\n{'─'*40}  TOP {len(top)} RESULTS:")
     for i, r in enumerate(top, 1):
-        logger.info(f"  {i:>2}. {r['symbol']:<10} Score={r['pump_score']}/10  RSI={r['rsi']:.1f}")
+        logger.info(f"  {i:>2}. {r['symbol']:<10} {r['pump_score']}/10  RSI={r['rsi']:.1f}  {r['trend_label']}")
 
-    STATUS["last_scan"]  = start.strftime("%Y-%m-%d %H:%M UTC")
-    STATUS["top_coins"]  = top
-    STATUS["scan_count"] += 1
-    STATUS["status"]     = "idle"
+    STATUS.update({
+        "last_scan" : start.strftime("%Y-%m-%d %H:%M UTC"),
+        "top_coins" : top,
+        "scan_count": STATUS["scan_count"] + 1,
+        "status"    : "idle",
+    })
 
     send_scan_results(top, len(tradeable))
-    logger.info(f"✅ Scan done in {(datetime.now()-start).total_seconds():.1f}s")
+    logger.info(f"✅ Done in {(datetime.now()-start).total_seconds():.1f}s — signals sent to Telegram")
 
+
+# ── Scanner Loop (background thread) ─────────────────────────
 
 def scanner_loop(exchanges):
     interval = SCAN_INTERVAL_MINUTES * 60
-    logger.info(f"⏱  Scanner thread — every {SCAN_INTERVAL_MINUTES} min")
-
-    # Wait 10s for HTTP server to fully start first
-    time.sleep(10)
+    logger.info(f"⏱  Scanner: every {SCAN_INTERVAL_MINUTES} min")
+    time.sleep(5)   # let HTTP server settle
 
     try:
         run_scan(exchanges)
@@ -198,32 +183,26 @@ def scanner_loop(exchanges):
 
 def main():
     PORT = int(os.environ.get("PORT", 10000))
+    print("\n🚀 CRYPTO PUMP SCANNER — STARTING\n")
 
-    print("""
-╔══════════════════════════════════════════════╗
-║     🚀 CRYPTO PUMP SCANNER — RENDER FREE     ║
-╚══════════════════════════════════════════════╝
-""")
-
-    # Step 1: Start HTTP server FIRST (Render needs port binding immediately)
+    # 1. HTTP server FIRST — Render needs port immediately
     server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    logger.info(f"🌐 HTTP server started on port {PORT}")
+    logger.info(f"🌐 HTTP server on port {PORT}")
 
-    # Step 2: Init exchanges in background thread
+    # 2. Init exchanges + start scanner in background
     def start_scanner():
         try:
             exchanges = init_exchanges()
-            logger.info(f"Connected: {list(exchanges.keys())}")
+            logger.info(f"Exchanges: {list(exchanges.keys())}")
             scanner_loop(exchanges)
         except Exception as e:
-            logger.critical(f"Scanner failed: {e}", exc_info=True)
-            STATUS["status"] = f"error: {e}"
+            logger.critical(f"Fatal: {e}", exc_info=True)
+            STATUS["status"] = f"fatal: {e}"
 
-    t = threading.Thread(target=start_scanner, daemon=True)
-    t.start()
+    threading.Thread(target=start_scanner, daemon=True).start()
 
-    # Step 3: HTTP server runs forever on main thread
-    logger.info("✅ Ready — scanner starting in background …")
+    # 3. HTTP runs forever on main thread
+    logger.info("✅ Bot live — scanner starting…")
     server.serve_forever()
 
 
